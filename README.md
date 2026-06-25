@@ -30,6 +30,12 @@ is delegated to `encoding/base64` itself, so behavior is identical by constructi
 - arm64: 48-byte encode blocks via LD3+TBL+ST4; 64-char decode blocks via LD4+TBL/TBX+ST3.
 - amd64: runtime CPUID selects AVX2 or SSSE3; encode blocks are 24 / 12 bytes and decode blocks are 32 / 16 chars.
 
+Small inputs may not enter the kernels.
+On arm64, a 32-byte encode is below the 48-byte block size,
+and its 44-character output is below the 64-character decode block size.
+Those cases mostly measure wrapper and stdlib fallback overhead,
+so they can be slower than `encoding/base64`.
+
 The amd64 kernels implement Wojciech Muła's [base64 SIMD algorithms](http://0x80.pl/notesen/2016-01-12-sse-base64-encoding.html);
 the arm64 kernels follow the design of [aklomp/base64](https://github.com/aklomp/base64).
 
@@ -53,3 +59,5 @@ Verified against `encoding/base64` by differential tests and fuzzing,
 covering predefined and custom/padded/strict encodings, corrupt input,
 error values, truncations, embedded newlines and streaming APIs.
 All three kernel sets are exercised in CI-style runs: NEON natively on Apple Silicon, SSSE3 under Rosetta 2, and AVX2 inside a QEMU `-cpu max` VM.
+Benchmark output is published by GitHub Actions,
+so current CI numbers are available at [github.com/xiaost/base64/actions](https://github.com/xiaost/base64/actions).
