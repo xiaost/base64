@@ -2,6 +2,11 @@
 
 package simd
 
+const (
+	stdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	urlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
 // Active returns the name of the kernel set in use, for diagnostics.
 func Active() string { return "neon" }
 
@@ -17,10 +22,11 @@ type Encoder struct {
 	lut [64]byte
 }
 
-// Decoder holds the NEON decode table: a 256-byte char->value map with
-// 0xFF marking invalid bytes, looked up as four 64-byte TBL chunks.
+// Decoder holds the NEON decode tables. Standard and URL alphabets use
+// the 80-byte nibble table; custom alphabets use the 256-byte LUT.
 type Decoder struct {
 	lut [256]byte
+	tab *[80]byte
 }
 
 func NewEncoder(alphabet *[64]byte) *Encoder {
@@ -36,7 +42,43 @@ func NewDecoder(alphabet *[64]byte) *Decoder {
 	for i, c := range alphabet {
 		d.lut[c] = byte(i)
 	}
+	switch string(alphabet[:]) {
+	case stdAlphabet:
+		d.tab = &stdDecodeTab
+	case urlAlphabet:
+		d.tab = &urlDecodeTab
+	}
 	return d
+}
+
+var (
+	stdDecodeTab = decodeTab(false)
+	urlDecodeTab = decodeTab(true)
+)
+
+func decodeTab(url bool) [80]byte {
+	var lo, hi, roll [16]byte
+	var marker, adj byte
+	if url {
+		lo = [16]byte{0x25, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x23, 0x3B, 0x3B, 0x3A, 0x3B, 0x33}
+		hi = [16]byte{0x20, 0x20, 0x01, 0x02, 0x04, 0x08, 0x04, 0x10, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20}
+		roll = [16]byte{0, 0, 17, 4, 0xBF, 0xBF, 0xB9, 0xB9, 0, 0, 0, 0, 0, 0xE0, 0, 0}
+		marker, adj = '_', 8
+	} else {
+		lo = [16]byte{0x15, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x13, 0x1A, 0x1B, 0x1B, 0x1B, 0x1A}
+		hi = [16]byte{0x10, 0x10, 0x01, 0x02, 0x04, 0x08, 0x04, 0x08, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10}
+		roll = [16]byte{0, 16, 19, 4, 0xBF, 0xBF, 0xB9, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0}
+		marker, adj = '/', 0xFF
+	}
+	var t [80]byte
+	copy(t[0:], lo[:])
+	copy(t[16:], hi[:])
+	copy(t[32:], roll[:])
+	for i := range 16 {
+		t[48+i] = marker
+		t[64+i] = adj
+	}
+	return t
 }
 
 // Encode converts whole 48-byte blocks of src into 64-byte blocks of dst.
@@ -65,7 +107,11 @@ func (d *Decoder) Decode(dst, src []byte) (nd, ns int) {
 	if n == 0 {
 		return 0, 0
 	}
-	ns = decodeNEON(&dst[0], &src[0], n*64, &d.lut[0])
+	if d.tab != nil {
+		ns = decodeNEONFast(&dst[0], &src[0], n*64, &d.tab[0])
+	} else {
+		ns = decodeNEON(&dst[0], &src[0], n*64, &d.lut[0])
+	}
 	return ns / 4 * 3, ns
 }
 
@@ -74,3 +120,6 @@ func encodeNEON(dst, src *byte, n int, lut *byte)
 
 //go:noescape
 func decodeNEON(dst, src *byte, n int, lut *byte) int
+
+//go:noescape
+func decodeNEONFast(dst, src *byte, n int, tab *byte) int

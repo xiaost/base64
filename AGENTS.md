@@ -42,6 +42,7 @@ Prefer differential tests against `encoding/base64` over golden-only tests.
 - Use `pairs()` for the encoding matrix and `noSIMD()` for fallback paths.
 - Around encode/decode boundary changes, cover SIMD edges: 48/64 on arm64, 16/32 on amd64.
 - Around kernels or CPU selection, run native tests, `-tags purego`, and benchmarks; also test amd64 via Rosetta/QEMU or GitHub Actions when possible.
+- For SIMD optimization, benchmark `simd` sub-benchmarks only unless stdlib comparison is needed.
 - Keep unit tests short and targeted; place them in `_test.go` next to the behavior.
 
 ## Changes

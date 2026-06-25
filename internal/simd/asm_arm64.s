@@ -16,6 +16,19 @@
 
 #include "textflag.h"
 
+#define DECODE_NIBBLE(IN, OUT, BAD, HI, LO, TMP) \
+	VUSHR $4, IN.B16, HI.B16 \
+	VAND  V31.B16, HI.B16, HI.B16 \
+	VAND  V31.B16, IN.B16, LO.B16 \
+	VTBL  LO.B16, [V8.B16], BAD.B16 \
+	VTBL  HI.B16, [V9.B16], TMP.B16 \
+	VAND  TMP.B16, BAD.B16, BAD.B16 \
+	VCMEQ V11.B16, IN.B16, TMP.B16 \
+	VAND  V12.B16, TMP.B16, TMP.B16 \
+	VADD  TMP.B16, HI.B16, HI.B16 \
+	VTBL  HI.B16, [V10.B16], OUT.B16 \
+	VADD  OUT.B16, IN.B16, OUT.B16
+
 // func encodeNEON(dst, src *byte, n int, lut *byte)
 // n > 0 and a multiple of 48; writes n/3*4 bytes to dst.
 TEXT ·encodeNEON(SB), NOSPLIT, $0-32
@@ -142,3 +155,58 @@ deloop:
 dedone:
 	MOVD R4, ret+32(FP)
 	RET
+
+// func decodeNEONFast(dst, src *byte, n int, tab *byte) int
+// n > 0 and a multiple of 64; tab is lo/hi/roll/marker/adjustment vectors.
+TEXT ·decodeNEONFast(SB), NOSPLIT, $0-40
+	MOVD dst+0(FP), R0
+	MOVD src+8(FP), R1
+	MOVD n+16(FP), R2
+	MOVD tab+24(FP), R3
+
+	VLD1.P 16(R3), [V8.B16]  // lo-nibble invalid mask
+	VLD1.P 16(R3), [V9.B16]  // hi-nibble invalid mask
+	VLD1.P 16(R3), [V10.B16] // roll lut
+	VLD1.P 16(R3), [V11.B16] // marker char
+	VLD1   (R3), [V12.B16]   // marker adjustment
+	MOVD   $0x0F, R5
+	VDUP   R5, V31.B16
+	MOVD   $0, R4
+
+dfloop:
+	VLD4.P 64(R1), [V0.B16, V1.B16, V2.B16, V3.B16]
+
+	DECODE_NIBBLE(V0, V4, V20, V13, V14, V15)
+	DECODE_NIBBLE(V1, V5, V21, V13, V14, V15)
+	DECODE_NIBBLE(V2, V6, V22, V13, V14, V15)
+	DECODE_NIBBLE(V3, V7, V23, V13, V14, V15)
+
+	VORR V21.B16, V20.B16, V24.B16
+	VORR V22.B16, V24.B16, V24.B16
+	VORR V23.B16, V24.B16, V24.B16
+	VMOV V24.D[0], R5
+	VMOV V24.D[1], R6
+	ORR  R6, R5, R5
+	CBNZ R5, dfdone
+
+	// out0 = v0<<2 | v1>>4; out1 = v1<<4 | v2>>2; out2 = v2<<6 | v3
+	VSHL  $2, V4.B16, V28.B16
+	VUSHR $4, V5.B16, V25.B16
+	VORR  V25.B16, V28.B16, V28.B16
+	VSHL  $4, V5.B16, V29.B16
+	VUSHR $2, V6.B16, V25.B16
+	VORR  V25.B16, V29.B16, V29.B16
+	VSHL  $6, V6.B16, V30.B16
+	VORR  V7.B16, V30.B16, V30.B16
+
+	VST3.P [V28.B16, V29.B16, V30.B16], 48(R0)
+
+	ADD  $64, R4
+	SUBS $64, R2, R2
+	BGT  dfloop
+
+dfdone:
+	MOVD R4, ret+32(FP)
+	RET
+
+#undef DECODE_NIBBLE

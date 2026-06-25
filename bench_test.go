@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-var benchSizes = []int{32, 256, 1 << 10, 8 << 10, 64 << 10, 1 << 20}
+var benchSizes = []int{32, 128, 256, 1 << 10, 4 << 10, 64 << 10}
 
 func label(n int) string {
 	if n >= 1<<20 {
