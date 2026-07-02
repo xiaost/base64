@@ -12,7 +12,7 @@
 // Decode: each 32-byte input block yields 24 output bytes. Hi/lo nibble
 // pshufb masks classify bytes (AND != 0 means invalid: padding, newlines,
 // garbage -> stop before consuming the block); a roll lut indexed by hi
-// nibble (adjusted for the marker char '/' or '_') converts ASCII to 6-bit
+// nibble (index 0 for the marker char '/' or '_') converts ASCII to 6-bit
 // values; maddubs/madd packs them into 24-bit groups and a shuffle+permd
 // compacts the result.
 
@@ -103,6 +103,49 @@ enloop:
 	VZEROUPPER
 	RET
 
+// func encodeAVX2Last(dst, src *byte, lut *byte)
+// Like encodeAVX2, but handles one final 24-byte block without reading
+// past src+24.
+TEXT ·encodeAVX2Last(SB), NOSPLIT, $0-24
+	MOVQ dst+0(FP), DI
+	MOVQ src+8(FP), SI
+	MOVQ lut+16(FP), DX
+
+	VBROADCASTI128 (DX), Y7
+	VMOVDQU        encShuf<>(SB), Y6
+	VPBROADCASTD   encConst<>+0(SB), Y8
+	VPBROADCASTD   encConst<>+4(SB), Y9
+	VPBROADCASTD   encConst<>+8(SB), Y10
+	VPBROADCASTD   encConst<>+12(SB), Y11
+	VPBROADCASTB   encConst<>+16(SB), Y12
+	VPBROADCASTB   encConst<>+17(SB), Y13
+	VPBROADCASTB   encConst<>+18(SB), Y14
+
+	VMOVDQU     (SI), X0
+	VMOVDQU     8(SI), X1
+	VPSRLDQ     $4, X1, X1
+	VINSERTI128 $1, X1, Y0, Y0
+	VPSHUFB     Y6, Y0, Y0
+
+	// dword bytes -> [idx0, idx1, idx2, idx3]
+	VPAND    Y8, Y0, Y1
+	VPMULHUW Y9, Y1, Y1
+	VPAND    Y10, Y0, Y2
+	VPMULLW  Y11, Y2, Y2
+	VPOR     Y2, Y1, Y0
+
+	// ASCII translation: shift = lut[idx<26 ? 13 : satsub(idx,51)]
+	VPSUBUSB Y12, Y0, Y1
+	VPCMPGTB Y0, Y13, Y2
+	VPAND    Y14, Y2, Y2
+	VPOR     Y2, Y1, Y1
+	VPSHUFB  Y1, Y7, Y1
+	VPADDB   Y1, Y0, Y0
+
+	VMOVDQU Y0, (DI)
+	VZEROUPPER
+	RET
+
 // func decodeAVX2(dst, src *byte, blocks int, tab *byte) int
 // blocks > 0; returns the number of src bytes consumed (a multiple of 32);
 // writes consumed/4*3 bytes to dst.
@@ -112,11 +155,10 @@ TEXT ·decodeAVX2(SB), NOSPLIT, $0-40
 	MOVQ blocks+16(FP), CX
 	MOVQ tab+24(FP), DX
 
-	VMOVDQU      (DX), Y10    // lo-nibble mask
-	VMOVDQU      32(DX), Y11  // hi-nibble mask
-	VMOVDQU      64(DX), Y12  // roll lut
-	VMOVDQU      96(DX), Y13  // marker char
-	VMOVDQU      128(DX), Y14 // marker adjustment
+	VMOVDQU      (DX), Y10   // lo-nibble mask
+	VMOVDQU      32(DX), Y11 // hi-nibble mask
+	VMOVDQU      64(DX), Y12 // roll lut
+	VMOVDQU      96(DX), Y13 // marker char
 	VPBROADCASTD decConst<>+0(SB), Y8
 	VPBROADCASTD decConst<>+4(SB), Y7
 	VPBROADCASTB decConst<>+8(SB), Y9
@@ -135,10 +177,9 @@ deloop:
 	VPTEST  Y3, Y3
 	JNZ     dedone
 
-	// ASCII -> 6-bit values: x += roll[hi + (x==marker ? adj : 0)]
+	// ASCII -> 6-bit values: x += roll[x==marker ? 0 : hi]
 	VPCMPEQB Y13, Y0, Y3
-	VPAND    Y14, Y3, Y3
-	VPADDB   Y3, Y1, Y1
+	VPANDN   Y1, Y3, Y1
 	VPSHUFB  Y1, Y12, Y3
 	VPADDB   Y3, Y0, Y0
 
@@ -226,6 +267,67 @@ ensloop:
 	JNZ   ensloop
 	RET
 
+// func encodeSSELast(dst, src *byte, lut *byte)
+// Like encodeSSE, but handles one final 12-byte block without reading
+// past src+12.
+TEXT ·encodeSSELast(SB), NOSPLIT, $0-24
+	MOVQ dst+0(FP), DI
+	MOVQ src+8(FP), SI
+	MOVQ lut+16(FP), DX
+
+	MOVOU  (DX), X7
+	MOVOU  encShuf<>(SB), X6
+	MOVL   $0x0FC0FC00, AX
+	MOVQ   AX, X8
+	PSHUFD $0, X8, X8
+	MOVL   $0x04000040, AX
+	MOVQ   AX, X9
+	PSHUFD $0, X9, X9
+	MOVL   $0x003F03F0, AX
+	MOVQ   AX, X10
+	PSHUFD $0, X10, X10
+	MOVL   $0x01000010, AX
+	MOVQ   AX, X11
+	PSHUFD $0, X11, X11
+	MOVL   $0x33333333, AX
+	MOVQ   AX, X12
+	PSHUFD $0, X12, X12 // 51 in every byte
+	MOVL   $0x1A1A1A1A, AX
+	MOVQ   AX, X13
+	PSHUFD $0, X13, X13 // 26 in every byte
+	MOVL   $0x0D0D0D0D, AX
+	MOVQ   AX, X14
+	PSHUFD $0, X14, X14 // 13 in every byte
+
+	MOVQ   (SI), X0
+	MOVQ   4(SI), X1
+	PSRLDQ $4, X1
+	PSLLDQ $8, X1
+	POR    X1, X0
+	PSHUFB X6, X0
+
+	// dword bytes -> [idx0, idx1, idx2, idx3]
+	MOVOU   X0, X1
+	PAND    X8, X1
+	PMULHUW X9, X1
+	PAND    X10, X0
+	PMULLW  X11, X0
+	POR     X1, X0
+
+	// ASCII translation: shift = lut[idx<26 ? 13 : satsub(idx,51)]
+	MOVOU   X0, X1
+	PSUBUSB X12, X1
+	MOVOU   X13, X2
+	PCMPGTB X0, X2
+	PAND    X14, X2
+	POR     X2, X1
+	MOVOU   X7, X2
+	PSHUFB  X1, X2
+	PADDB   X2, X0
+
+	MOVOU X0, (DI)
+	RET
+
 // func decodeSSE(dst, src *byte, blocks int, tab *byte) int
 // SSSE3 variant of decodeAVX2: blocks > 0; returns the number of src
 // bytes consumed (a multiple of 16); writes consumed/4*3 bytes to dst.
@@ -235,11 +337,10 @@ TEXT ·decodeSSE(SB), NOSPLIT, $0-40
 	MOVQ blocks+16(FP), CX
 	MOVQ tab+24(FP), DX
 
-	MOVOU  (DX), X10    // lo-nibble mask
-	MOVOU  32(DX), X11  // hi-nibble mask
-	MOVOU  64(DX), X12  // roll lut
-	MOVOU  96(DX), X13  // marker char
-	MOVOU  128(DX), X14 // marker adjustment
+	MOVOU  (DX), X10   // lo-nibble mask
+	MOVOU  32(DX), X11 // hi-nibble mask
+	MOVOU  64(DX), X12 // roll lut
+	MOVOU  96(DX), X13 // marker char
 	MOVL   $0x01400140, AX
 	MOVQ   AX, X8
 	PSHUFD $0, X8, X8
@@ -271,14 +372,13 @@ desloop:
 	CMPL    BX, $0xFFFF
 	JNE     desdone
 
-	// ASCII -> 6-bit values: x += roll[hi + (x==marker ? adj : 0)]
-	MOVOU    X13, X3
-	PCMPEQB  X0, X3
-	PAND     X14, X3
-	PADDB    X3, X1
-	MOVOU    X12, X3
-	PSHUFB   X1, X3
-	PADDB    X3, X0
+	// ASCII -> 6-bit values: x += roll[x==marker ? 0 : hi]
+	MOVOU   X13, X3
+	PCMPEQB X0, X3
+	PANDN   X1, X3
+	MOVOU   X12, X4
+	PSHUFB  X3, X4
+	PADDB   X4, X0
 
 	// pack 4x6 bits -> 3 bytes per dword, compact to 12 bytes
 	PMADDUBSW X8, X0

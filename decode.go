@@ -54,14 +54,18 @@ func (e *Encoding) decodeSIMD(dst, src []byte, nd, ns int) (int, int) {
 	for {
 		// The kernel stopped: dst full or a block holding a byte it
 		// can't decode. Anything but a newline at a quantum boundary
-		// is left to the stdlib.
+		// is left to the stdlib. Wrapped lines that are a multiple of
+		// the block size stop right at the newline; skip the scan then.
 		w := src[ns:min(ns+nlWin, len(src))]
-		q := bytes.IndexByte(w, '\n')
-		if r := bytes.IndexByte(w, '\r'); r >= 0 && (q < 0 || r < q) {
-			q = r
-		}
-		if q < 0 || q%4 != 0 {
-			return nd, ns
+		q := 0
+		if w[0] != '\n' && w[0] != '\r' {
+			q = bytes.IndexByte(w, '\n')
+			if r := bytes.IndexByte(w, '\r'); r >= 0 && (q < 0 || r < q) {
+				q = r
+			}
+			if q < 0 || q%4 != 0 {
+				return nd, ns
+			}
 		}
 		// Lines shorter than a kernel block make no SIMD progress;
 		// after two stalled rounds hand the rest to the stdlib.

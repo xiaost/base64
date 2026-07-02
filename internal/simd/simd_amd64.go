@@ -21,14 +21,12 @@ func Active() string {
 }
 
 // Minimum src lengths below which Encode / Decode are no-ops.
-var MinEncode, MinDecode = minSizes()
-
-func minSizes() (enc, dec int) {
-	if hasAVX2 {
-		return 24 + 4, 32
-	}
-	return 12 + 4, 16
-}
+// The SSE kernels handle single 12-byte / 16-char blocks left over by
+// the AVX2 loop, so the minimums match the SSE block sizes either way.
+const (
+	MinEncode = 12
+	MinDecode = 16
+)
 
 func detectCPU() (avx2, ssse3 bool) {
 	maxID, _, _, _ := cpuidex(0, 0)
@@ -68,10 +66,14 @@ func NewEncoder(alphabet *[64]byte) *Encoder {
 }
 
 // Decoder holds the AVX2 classification tables (Muła's nibble scheme):
-// five 32-byte vectors at fixed offsets: lo-nibble mask, hi-nibble mask,
-// roll lut, marker char, marker index adjustment.
+// four 32-byte vectors at fixed offsets: lo-nibble mask, hi-nibble mask,
+// roll lut, marker char.
+//
+// The kernels turn the marker char's roll index into 0 (hi &^ eq-mask),
+// so roll[0] holds the marker's shift. Hi nibbles 0 and 1 also land on
+// roll[0], but such bytes never pass the invalid-char masks.
 type Decoder struct {
-	tab [160]byte
+	tab [128]byte
 }
 
 func NewDecoder(alphabet *[64]byte) *Decoder {
@@ -79,18 +81,18 @@ func NewDecoder(alphabet *[64]byte) *Decoder {
 		return nil
 	}
 	var lo, hi, roll [16]byte
-	var marker, adj byte
+	var marker byte
 	switch string(alphabet[:]) {
 	case stdAlphabet:
 		lo = [16]byte{0x15, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x13, 0x1A, 0x1B, 0x1B, 0x1B, 0x1A}
 		hi = [16]byte{0x10, 0x10, 0x01, 0x02, 0x04, 0x08, 0x04, 0x08, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10}
-		roll = [16]byte{0, 16, 19, 4, 0xBF, 0xBF, 0xB9, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0}
-		marker, adj = '/', 0xFF // '/': roll idx = hi(2)-1 = 1
+		roll = [16]byte{16, 0, 19, 4, 0xBF, 0xBF, 0xB9, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0}
+		marker = '/'
 	case urlAlphabet:
 		lo = [16]byte{0x25, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x23, 0x3B, 0x3B, 0x3A, 0x3B, 0x33}
 		hi = [16]byte{0x20, 0x20, 0x01, 0x02, 0x04, 0x08, 0x04, 0x10, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20}
-		roll = [16]byte{0, 0, 17, 4, 0xBF, 0xBF, 0xB9, 0xB9, 0, 0, 0, 0, 0, 0xE0, 0, 0}
-		marker, adj = '_', 8 // '_': roll idx = hi(5)+8 = 13
+		roll = [16]byte{0xE0, 0, 17, 4, 0xBF, 0xBF, 0xB9, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0}
+		marker = '_'
 	default:
 		return nil
 	}
@@ -100,40 +102,64 @@ func NewDecoder(alphabet *[64]byte) *Decoder {
 		d.tab[32+i] = hi[i%16]
 		d.tab[64+i] = roll[i%16]
 		d.tab[96+i] = marker
-		d.tab[128+i] = adj
 	}
 	return d
 }
 
 // Encode converts whole blocks of src (24 bytes with AVX2, 12 with SSSE3)
-// into blocks of dst (32 / 16 bytes). It returns the number of bytes
-// written and consumed. The kernels load 4 bytes past each block, so 4
-// readable bytes are kept past the consumed range.
+// into blocks of dst (32 / 16 bytes), plus one SSE block for a 12-byte
+// remainder the AVX2 loop leaves behind. It returns the number of bytes
+// written and consumed.
 func (e *Encoder) Encode(dst, src []byte) (nd, ns int) {
 	bin, bout := 12, 16
 	if hasAVX2 {
 		bin, bout = 24, 32
 	}
-	if len(src) < bin+4 {
-		return 0, 0
-	}
-	n := (len(src) - 4) / bin
+	n := len(src) / bin
 	if m := len(dst) / bout; m < n {
 		n = m
 	}
-	if n == 0 {
-		return 0, 0
+	if n > 0 {
+		full := n
+		last := false
+		// The loop kernels read 4 bytes past their final block; use a safe
+		// single-block kernel when the consumed range reaches the end of src.
+		if len(src) < n*bin+4 {
+			full--
+			last = true
+		}
+		if full > 0 {
+			if hasAVX2 {
+				encodeAVX2(&dst[0], &src[0], full, &e.lut[0])
+			} else {
+				encodeSSE(&dst[0], &src[0], full, &e.lut[0])
+			}
+		}
+		if last {
+			s, d := full*bin, full*bout
+			if hasAVX2 {
+				encodeAVX2Last(&dst[d], &src[s], &e.lut[0])
+			} else {
+				encodeSSELast(&dst[d], &src[s], &e.lut[0])
+			}
+		}
+		nd, ns = n*bout, n*bin
 	}
-	if hasAVX2 {
-		encodeAVX2(&dst[0], &src[0], n, &e.lut[0])
-	} else {
-		encodeSSE(&dst[0], &src[0], n, &e.lut[0])
+	if hasAVX2 && len(src)-ns >= 12 && len(dst)-nd >= 16 {
+		if len(src)-ns >= 16 {
+			encodeSSE(&dst[nd], &src[ns], 1, &e.lut[0])
+		} else {
+			encodeSSELast(&dst[nd], &src[ns], &e.lut[0])
+		}
+		nd += 16
+		ns += 12
 	}
-	return n * bout, n * bin
+	return nd, ns
 }
 
 // Decode converts whole blocks of src (32 bytes with AVX2, 16 with SSSE3)
-// into blocks of dst (24 / 12 bytes), stopping at the first block
+// into blocks of dst (24 / 12 bytes), plus one SSE block for a 16-char
+// remainder the AVX2 loop leaves behind. It stops at the first block
 // containing a byte that is not part of the alphabet (padding, newlines,
 // garbage). It returns the number of bytes written and consumed.
 func (d *Decoder) Decode(dst, src []byte) (nd, ns int) {
@@ -145,25 +171,39 @@ func (d *Decoder) Decode(dst, src []byte) (nd, ns int) {
 	if m := len(dst) / bout; m < n {
 		n = m
 	}
-	if n == 0 {
-		return 0, 0
+	if n > 0 {
+		if hasAVX2 {
+			ns = decodeAVX2(&dst[0], &src[0], n, &d.tab[0])
+		} else {
+			ns = decodeSSE(&dst[0], &src[0], n, &d.tab[0])
+		}
+		nd = ns / 4 * 3
+		if ns < n*bin {
+			return nd, ns // stopped at an invalid byte
+		}
 	}
-	if hasAVX2 {
-		ns = decodeAVX2(&dst[0], &src[0], n, &d.tab[0])
-	} else {
-		ns = decodeSSE(&dst[0], &src[0], n, &d.tab[0])
+	if hasAVX2 && len(src)-ns >= 16 && len(dst)-nd >= 12 {
+		s := decodeSSE(&dst[nd], &src[ns], 1, &d.tab[0])
+		nd += s / 4 * 3
+		ns += s
 	}
-	return ns / 4 * 3, ns
+	return nd, ns
 }
 
 //go:noescape
 func encodeAVX2(dst, src *byte, blocks int, lut *byte)
 
 //go:noescape
+func encodeAVX2Last(dst, src *byte, lut *byte)
+
+//go:noescape
 func decodeAVX2(dst, src *byte, blocks int, tab *byte) int
 
 //go:noescape
 func encodeSSE(dst, src *byte, blocks int, lut *byte)
+
+//go:noescape
+func encodeSSELast(dst, src *byte, lut *byte)
 
 //go:noescape
 func decodeSSE(dst, src *byte, blocks int, tab *byte) int

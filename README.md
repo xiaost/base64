@@ -27,14 +27,16 @@ is delegated to `encoding/base64` itself, so behavior is identical by constructi
 | amd64 | AVX2, else SSSE3 | encode: standard first 62; decode: std/URL |
 | other | none | stdlib |
 
-- arm64: 48-byte encode blocks via LD3+TBL+ST4; 64-char decode blocks via LD4+TBL/TBX+ST3.
-- amd64: runtime CPUID selects AVX2 or SSSE3; encode blocks are 24 / 12 bytes and decode blocks are 32 / 16 chars.
+- arm64: 48-byte encode blocks via LD3+TBL+ST4 plus a 24-byte tail block;
+  64-char decode blocks via LD4+TBL/TBX+ST3 plus in-order 16-char tail blocks
+  (custom alphabets decode in 64-char blocks only).
+- amd64: runtime CPUID selects AVX2 or SSSE3; encode blocks are 24 / 12 bytes
+  and decode blocks are 32 / 16 chars, and the AVX2 path hands its 12-byte /
+  16-char remainder to the SSE kernels.
 
-Small inputs may not enter the kernels.
-On arm64, a 32-byte encode is below the 48-byte block size,
-and its 44-character output is below the 64-character decode block size.
-Those cases mostly measure wrapper and stdlib fallback overhead,
-so they can be slower than `encoding/base64`.
+Inputs below one block (24-byte encode / 16-char decode on arm64,
+12 / 16 on amd64) never enter the kernels and mostly measure wrapper
+and stdlib fallback overhead.
 
 The amd64 kernels implement Wojciech Muła's [base64 SIMD algorithms](http://0x80.pl/notesen/2016-01-12-sse-base64-encoding.html);
 the arm64 kernels follow the design of [aklomp/base64](https://github.com/aklomp/base64).
