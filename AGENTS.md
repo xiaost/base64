@@ -48,3 +48,5 @@ Prefer differential tests against `encoding/base64` over golden-only tests.
 
 ## Changes
 Keep commits narrowly scoped, especially around assembly and public API parity.
+- Identify the affected platform for every change in commit messages and summaries,
+  for example `amd64: ...`, `arm64: ...`, `purego: ...`, or `all: ...`.

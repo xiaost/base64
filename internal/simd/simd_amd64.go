@@ -111,48 +111,61 @@ func NewDecoder(alphabet *[64]byte) *Decoder {
 // remainder the AVX2 loop leaves behind. It returns the number of bytes
 // written and consumed.
 func (e *Encoder) Encode(dst, src []byte) (nd, ns int) {
-	bin, bout := 12, 16
 	if hasAVX2 {
-		bin, bout = 24, 32
+		n := len(src) / 24
+		if m := len(dst) / 32; m < n {
+			n = m
+		}
+		if n > 0 {
+			consumed := n * 24
+			// The loop kernels read 4 bytes past their final block; switch
+			// only the final block to the bounded kernel when src ends there.
+			if len(src) >= consumed+4 {
+				encodeAVX2(&dst[0], &src[0], n, &e.lut[0])
+			} else {
+				full := n - 1
+				if full > 0 {
+					encodeAVX2(&dst[0], &src[0], full, &e.lut[0])
+				}
+				s, d := full*24, full*32
+				encodeAVX2Last(&dst[d], &src[s], &e.lut[0])
+			}
+			nd, ns = n*32, consumed
+		}
+		// An AVX2 pass can leave one 12-byte block, which the SSE kernel can
+		// still encode before the caller falls back for the shorter tail.
+		if len(src)-ns >= 12 && len(dst)-nd >= 16 {
+			if len(src)-ns >= 16 {
+				encodeSSE(&dst[nd], &src[ns], 1, &e.lut[0])
+			} else {
+				encodeSSELast(&dst[nd], &src[ns], &e.lut[0])
+			}
+			nd += 16
+			ns += 12
+		}
+		return nd, ns
 	}
-	n := len(src) / bin
-	if m := len(dst) / bout; m < n {
+
+	n := len(src) / 12
+	if m := len(dst) / 16; m < n {
 		n = m
 	}
 	if n > 0 {
-		full := n
-		last := false
-		// The loop kernels read 4 bytes past their final block; use a safe
-		// single-block kernel when the consumed range reaches the end of src.
-		if len(src) < n*bin+4 {
-			full--
-			last = true
-		}
-		if full > 0 {
-			if hasAVX2 {
-				encodeAVX2(&dst[0], &src[0], full, &e.lut[0])
-			} else {
+		consumed := n * 12
+		// SSSE3 has the same 4-byte over-read constraint as AVX2, but its
+		// final-block kernel handles a single 12-byte block directly.
+		if len(src) >= consumed+4 {
+			encodeSSE(&dst[0], &src[0], n, &e.lut[0])
+			nd, ns = n*16, consumed
+		} else {
+			full := n - 1
+			if full > 0 {
 				encodeSSE(&dst[0], &src[0], full, &e.lut[0])
 			}
+			s, d := full*12, full*16
+			encodeSSELast(&dst[d], &src[s], &e.lut[0])
+			nd, ns = n*16, consumed
 		}
-		if last {
-			s, d := full*bin, full*bout
-			if hasAVX2 {
-				encodeAVX2Last(&dst[d], &src[s], &e.lut[0])
-			} else {
-				encodeSSELast(&dst[d], &src[s], &e.lut[0])
-			}
-		}
-		nd, ns = n*bout, n*bin
-	}
-	if hasAVX2 && len(src)-ns >= 12 && len(dst)-nd >= 16 {
-		if len(src)-ns >= 16 {
-			encodeSSE(&dst[nd], &src[ns], 1, &e.lut[0])
-		} else {
-			encodeSSELast(&dst[nd], &src[ns], &e.lut[0])
-		}
-		nd += 16
-		ns += 12
 	}
 	return nd, ns
 }
